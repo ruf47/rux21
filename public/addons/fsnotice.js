@@ -1,0 +1,557 @@
+/* Fullscreen login notice — standalone addon for "Our Discussion Room".
+   Self-contained on purpose: it never touches public/addons/addon.js.
+   Features:
+   1) After every LOGIN (not on plain reloads) a black fullscreen DIV — no
+      iframe, mobile-friendly — shows the admin's raw HTML/CSS/JS notice;
+      the OK button ("বুঝেছি") hands the user back to the app. A TALL notice
+      starts at the TOP; a SHORT one is centered vertically inside the div.
+   2) The editor lives ONLY in the /admin page — a card right next to the
+      app's own notice card, following the app's light/dark theme.
+   3) While the overlay is open a socket event (updateFsNotice) refreshes it
+      live when the admin saves a new version.
+   4) Chat scroll guard: the bundled app force-jumps to the very bottom on
+      every new message. This addon stops that jump while the user is reading
+      mid-history, and keeps following the tail ONLY while the user is already
+      at the bottom.
+   Backend endpoints: GET/PUT /api/chat/getFsNotice|updateFsNotice
+   (older backends answer 404 → the feature silently stays off).
+*/
+(() => {
+  "use strict";
+  if (window.__bcaFsNotice) return;
+  window.__bcaFsNotice = true;
+
+  // ---------- tiny shared bits ----------
+  const FS_SEEN_KEY = "bcaFsNoticeSeenLoginAt";
+  let fsNoticeCache = null; // { notice, updatedAt } — null = not fetched yet
+  let fsSupported = true;   // flips false on a 404 (older backend)
+  let loggedIn = false;
+  let me = null;
+  let shownFor = null;      // loginAt already shown during this page-load
+  let fsNoticeWatchHooked = false; // set once hookSocket() runs (polling mode)
+
+  const curLang = () => (localStorage.getItem("langPref") === "en" ? "en" : "bn");
+  /** tiny setTimeout helper used for retries/toasts */
+  const t = (ms, fn) => setTimeout(fn, ms);
+  const STRINGS = {
+    en: {
+      ok: "Understood",
+      editorTitle: "Fullscreen notice",
+      editorLabel: "HTML / CSS / JS code (one line)",
+      editorHint: "A black fullscreen page showing this HTML/CSS/JS — every user sees it right after login and presses the button to enter the chat. Write it as ONE line; use <br> for line breaks. Tall notices start at the top, short ones are centered. It loads only for logged-in users, once per login.",
+      save: "Save notice",
+      saving: "Saving…",
+      preview: "Preview",
+      clear: "Clear",
+      clearConfirm: "Clear the fullscreen notice? It saves empty immediately — nobody will see it on the next login.",
+      savedMsg: "✓ Fullscreen notice saved",
+      tooLarge: "The code is too large — shorten it a little",
+      sessionExpired: "Session expired — reload the page and log in again",
+      noServer: "Can't reach the server",
+      saved: "✓ Saved",
+      fetchFail: "Couldn't load data",
+      chars: "chars",
+      cardBadge: "addon",
+      okLabelLabel: "Button text (empty = \"Understood\")",
+      btnAlignLabel: "Button position",
+      btnAlignLeft: "Left", btnAlignCenter: "Center", btnAlignRight: "Right",
+      modeLabel: "Message storage (server speed)",
+      modeGist: "GitHub Gist — durable (slower)",
+      modeMemory: "RAM — fast (messages lost on redeploy)",
+      modeHint: "Users & settings always stay on the Gist in both modes.",
+      modeSaved: "✓ Storage mode saved",
+    },
+    bn: {
+      ok: "বুঝেছি",
+      editorTitle: "ফুল স্ক্রিন নোটিশ",
+      editorLabel: "HTML / CSS / JS কোড (এক লাইন)",
+      editorHint: "কালো ফুল-স্ক্রিন পেজে এই HTML/CSS/JS-ই দেখাবে — প্রত্যেক ইউজার লগইনের পরপরই এটা দেখবে, বাটন চাপলে চ্যাটে ঢুকবে। এক লাইনে লিখুন; লাইন ভাঙতে <br> দিন। বড় নোটিশ উপর থেকে শুরু হয়, ছোটটা মাঝখানে দেখায়। লোড হয় শুধু লগইন-করা ইউজারের জন্য, লগইনে একবার।",
+      save: "নোটিশ সেভ করুন",
+      saving: "সেভ হচ্ছে…",
+      preview: "প্রিভিউ",
+      clear: "মুছে ফেলুন",
+      clearConfirm: "ফুল স্ক্রিন নোটিশ মুছে ফেলব? সাথে সাথে খালি সেভ হবে — পরের লগইনে আর কেউ দেখবে না।",
+      savedMsg: "✓ ফুল স্ক্রিন নোটিশ সেভ হয়েছে",
+      tooLarge: "কোডটা অনেক বড় — একটু ছোট করুন",
+      sessionExpired: "সেশন শেষ — পেজ রিলোড করে আবার লগইন করুন",
+      noServer: "সার্ভারে পৌঁছানো যাচ্ছে না",
+      saved: "✓ সেভ হয়েছে",
+      fetchFail: "তথ্য আনা যায়নি",
+      chars: "অক্ষর",
+      cardBadge: "অ্যাড-অন",
+      okLabelLabel: "বাটনের লেখা (খালি = “বুঝেছি”)",
+      btnAlignLabel: "বাটনের অবস্থান",
+      btnAlignLeft: "বামে", btnAlignCenter: "মাঝে", btnAlignRight: "ডানে",
+      modeLabel: "মেসেজ স্টোরেজ (সার্ভার গতি)",
+      modeGist: "GitHub Gist — স্থায়ী (ধীর)",
+      modeMemory: "RAM — দ্রুত (রিডিপ্লয়ে মেসেজ মুছে যাবে)",
+      modeHint: "দুই অবস্থাতেই ইউজার ও সেটিংস Gist-এই থাকবে।",
+      modeSaved: "✓ স্টোরেজ মোড সেভ হয়েছে",
+    },
+  };
+  const S = () => STRINGS[curLang()];
+  const appIsDark = () => !!document.querySelector(".navbar.bg-dark");
+
+  function host() {
+    let el = document.getElementById("bca-fs-root");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "bca-fs-root";
+      document.body.appendChild(el);
+    }
+    return el;
+  }
+
+  async function fetchJson(path, opts) {
+    const res = await fetch(path, { credentials: "same-origin", ...(opts || {}) });
+    if (!res.ok) return { status: res.status, body: null };
+    return { status: res.status, body: await res.json().catch(() => null) };
+  }
+
+  // ---------- fullscreen overlay ----------
+  function fsSeenLoginAt() {
+    try { return localStorage.getItem(FS_SEEN_KEY) || ""; } catch { return ""; }
+  }
+  function markFsSeen(loginAt) {
+    try { localStorage.setItem(FS_SEEN_KEY, loginAt || "?"); } catch { /* private mode */ }
+  }
+
+  /** innerHTML leaves <script> nodes inert — recreate them so admin JS runs */
+  function activateScripts(container) {
+    container.querySelectorAll("script").forEach((old) => {
+      const s = document.createElement("script");
+      if (old.src) s.src = old.src;
+      s.type = old.type || "text/javascript";
+      s.text = old.textContent || "";
+      old.parentNode.replaceChild(s, old);
+    });
+  }
+
+  function closeOverlay() {
+    host().querySelectorAll(".bca-fsoverlay").forEach((x) => x.remove());
+    document.body.classList.remove("bca-fslock");
+  }
+
+  function showOverlay(html, okLabel, align) {
+    closeOverlay();
+    const overlay = document.createElement("div");
+    overlay.className = "bca-fsoverlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.innerHTML = `
+      <div class="bca-fscontent"><div class="bca-fsinner"></div></div>
+      <div class="bca-fsbar" hidden>
+        <button type="button" class="bca-fsok"></button>
+      </div>`;
+    const okBtn = overlay.querySelector(".bca-fsok");
+    okBtn.textContent = okLabel || S().ok;
+    if (okLabel) okBtn.dataset.custom = okLabel; // survives live language flips
+    // owner request: the button may sit left/center/right (default left —
+    // the historical inline flow)
+    overlay.classList.add("bca-fsok-align-" + (align === "center" || align === "right" ? align : "left"));
+    okBtn.addEventListener("click", closeOverlay);
+    const inner = overlay.querySelector(".bca-fsinner");
+    // admin-authored raw html/css/js — the SAME trust decision as the
+    // attendance counter page (server stores it raw, only admins write)
+    inner.innerHTML = html;
+    activateScripts(inner);
+    // the button lives INSIDE the scrolling content, right after the notice
+    // (not pinned to the screen bottom); the fixed bar only appears for
+    // very long notices so a button is always reachable
+    const content = overlay.querySelector(".bca-fscontent");
+    const bar = overlay.querySelector(".bca-fsbar");
+    const tail = document.createElement("div");
+    tail.className = "bca-fstail";
+    // inline (owner request): the button flows on the SAME line where the
+    // notice text ends — not on its own line below. Works because the
+    // notice is authored as inline text + <br> lines; if the notice ends
+    // with a block element (div/p), the button naturally starts after it.
+    tail.style.display = "inline";
+    tail.style.marginLeft = "10px";
+    tail.appendChild(okBtn);
+    inner.appendChild(tail);
+    host().appendChild(overlay);
+    document.body.classList.add("bca-fslock");
+    hookSocket(); // polling-mode notice watch (no websocket — one shared addon surface)
+    requestAnimationFrame(() => {
+      if (content.scrollHeight > content.clientHeight + 40) bar.hidden = false;
+    });
+    // tall notice → starts at the TOP and scrolls down to the button; short
+    // notice → the CSS auto-margins center it vertically inside the div
+  }
+
+  async function refetchNotice() {
+    const got = await fetchJson("/api/chat/getFsNotice");
+    if (got.status === 404) { fsSupported = false; return null; }
+    if (got.status !== 200 || !got.body) return null; // transient
+    fsNoticeCache = {
+      notice: typeof got.body.notice === "string" ? got.body.notice : "",
+      updatedAt: got.body.updatedAt || "",
+      okLabel: typeof got.body.okLabel === "string" ? got.body.okLabel.slice(0, 60) : "",
+      btnAlign: got.body.btnAlign === "center" || got.body.btnAlign === "right" ? got.body.btnAlign : "left",
+      messageStoreMode: got.body.messageStoreMode === "gist" ? "gist" : "memory",
+    };
+    return fsNoticeCache;
+  }
+
+  /** show the notice when this is a NEW login (loginAt changed); plain
+      reloads keep the same loginAt, so they never re-show it */
+  async function maybeShow() {
+    if (!loggedIn || !me || !fsSupported) return;
+    // the addon's forced-credentials modal has priority — never stack on it
+    if (document.querySelector(".bca-overlay")) return;
+    if (host().querySelector(".bca-fsoverlay")) return;
+    const html = (fsNoticeCache && fsNoticeCache.notice) || "";
+    if (!html.trim()) return;
+    const loginAt = String((me && me.loginAt) || "");
+    if (shownFor !== null && shownFor === loginAt) return;
+    if (loginAt && fsSeenLoginAt() === loginAt) return;
+    shownFor = loginAt;
+    markFsSeen(loginAt);
+    showOverlay(fsNoticeCache.notice, fsNoticeCache.okLabel, fsNoticeCache.btnAlign);
+  }
+
+  // ---------- notice change watch (lightweight /users/me loginAt polling) ----------
+  // The addon layer now shares ONE connection surface: no per-addon websocket
+  // (owner request). A changed loginAt = a new login → refetch the notice and
+  // (if an overlay is open) refresh it. For mid-session admin edits the
+  // evaluate() loop refetches every ~5s ONLY while an overlay is actually on
+  // screen — ~12 tiny JSON calls/min on one page per admin-edit session,
+  // zero when nobody is reading the notice.
+  function loadSocketClient() { return Promise.resolve(null); } // legacy hook — sockets retired
+  async function hookSocket() {
+    // The addon layer shares ONE connection surface now (owner request:
+    // no per-addon websocket). Notice refresh = lightweight /users/me
+    // loginAt-polling (see evaluate below); mid-session admin edits are
+    // picked up by the overlay-open refetch loop.
+    fsNoticeWatchHooked = true;
+  }
+
+  // ---------- tiny local toast (same look as the main addon's .bca-toast,
+  // which lives in addon.js and must not be reached from here) ----------
+  function showToast(message, isErr = false) {
+    const el = document.createElement("div");
+    el.className = "bca-toast" + (isErr ? " err" : "");
+    el.textContent = message;
+    host().appendChild(el);
+    t(3200, () => el.remove());
+  }
+
+  // ---------- editor (the /admin card) ----------
+  function makeEditor(box) {
+    const s = S();
+    box.classList.add("bca-fssetting");
+    box.innerHTML = `
+      <div class="bca-fslabel"></div>
+      <div class="bca-fshint2"></div>
+      <textarea class="bca-fseditor" spellcheck="false" wrap="off"></textarea>
+      <div class="bca-fslabel bca-fsoklabel-label"></div>
+      <input type="text" class="bca-fsoklabel" maxlength="60" />
+      <div class="bca-fslabel bca-fsalignlabel"></div>
+      <select class="bca-fsalign">
+        <option value="left"></option>
+        <option value="center"></option>
+        <option value="right"></option>
+      </select>
+      <div class="bca-fslabel bca-fsmodelabel"></div>
+      <div class="bca-fsmodeswitch">
+        <label class="bca-fsmodeopt"><input type="radio" name="bca-fs-storemode" value="gist" /><span class="bca-fsmodegist"></span></label>
+        <label class="bca-fsmodeopt"><input type="radio" name="bca-fs-storemode" value="memory" /><span class="bca-fsmodememory"></span></label>
+      </div>
+      <div class="bca-fshint2 bca-fsmodehint"></div>
+      <div class="bca-fsbar2">
+        <span class="bca-fscount"></span>
+        <span class="bca-fsmsg"></span>
+        <button type="button" class="bca-fsmini bca-fspreview"></button>
+        <button type="button" class="bca-fssave"></button>
+        <button type="button" class="bca-fsmini bca-fsclear"></button>
+      </div>`;
+    box.querySelector(".bca-fslabel").textContent = s.editorLabel;
+    box.querySelector(".bca-fshint2").textContent = s.editorHint;
+    const okLabelInput = box.querySelector(".bca-fsoklabel");
+    box.querySelector(".bca-fsoklabel-label").textContent = s.okLabelLabel;
+    okLabelInput.placeholder = s.ok;
+    const alignSel = box.querySelector(".bca-fsalign");
+    box.querySelector(".bca-fsalignlabel").textContent = s.btnAlignLabel;
+    const alignOpts = { left: s.btnAlignLeft, center: s.btnAlignCenter, right: s.btnAlignRight };
+    alignSel.querySelectorAll("option").forEach((o) => { o.textContent = alignOpts[o.value] || o.value; });
+    box.querySelector(".bca-fsmodelabel").textContent = s.modeLabel;
+    box.querySelector(".bca-fsmodegist").textContent = s.modeGist;
+    box.querySelector(".bca-fsmodememory").textContent = s.modeMemory;
+    box.querySelector(".bca-fsmodehint").textContent = s.modeHint;
+    const modeRadios = () => [...box.querySelectorAll('input[name="bca-fs-storemode"]')];
+    const editor = box.querySelector(".bca-fseditor");
+    const count = box.querySelector(".bca-fscount");
+    const msg = box.querySelector(".bca-fsmsg");
+    const saveBtn = box.querySelector(".bca-fssave");
+    const previewBtn = box.querySelector(".bca-fspreview");
+    const clearBtn = box.querySelector(".bca-fsclear");
+    saveBtn.textContent = s.save;
+    previewBtn.textContent = s.preview;
+    clearBtn.textContent = s.clear;
+    const LIMIT = 100000;
+    const paintCount = () => {
+      count.textContent = `${editor.value.length.toLocaleString()} / ${LIMIT.toLocaleString()} ${s.chars}`;
+      count.classList.toggle("over", editor.value.length > LIMIT);
+    };
+    editor.addEventListener("input", () => { paintCount(); msg.textContent = ""; });
+
+    const saveNow = async (overrideHtml, overrideOkLabel, overrideMode, overrideAlign) => {
+      const html = typeof overrideHtml === "string" ? overrideHtml : editor.value;
+      const okLabel = typeof overrideOkLabel === "string" ? overrideOkLabel : okLabelInput.value.trim();
+      const mode = typeof overrideMode === "string" ? overrideMode : (modeRadios().find((r) => r.checked)?.value || null);
+      const align = typeof overrideAlign === "string" ? overrideAlign : (alignSel.value || "left");
+      if (html.length > LIMIT) { msg.textContent = s.tooLarge; return false; }
+      saveBtn.disabled = true;
+      const label = saveBtn.textContent;
+      saveBtn.textContent = s.saving;
+      msg.textContent = "";
+      try {
+        const res = await fetch("/api/chat/updateFsNotice", {
+          method: "PUT",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ notice: html, okLabel, btnAlign: align, ...(mode ? { messageStoreMode: mode } : {}) }),
+        });
+        if (res.status === 401) { msg.textContent = s.sessionExpired; return false; }
+        if (!res.ok) {
+          const body = await res.json().catch(() => null);
+          msg.textContent = body && body.errorMessage ? body.errorMessage : s.fetchFail;
+          return false;
+        }
+        editor.value = html;
+        paintCount();
+        msg.textContent = s.saved;
+        fsNoticeCache = { notice: html, updatedAt: new Date().toISOString(), okLabel, btnAlign: align };
+        return true;
+      } catch {
+        msg.textContent = s.noServer;
+        return false;
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = label;
+      }
+    };
+
+    saveBtn.addEventListener("click", () => saveNow());
+    previewBtn.addEventListener("click", () => { if (editor.value.trim()) showOverlay(editor.value, okLabelInput.value.trim(), alignSel.value); });
+    // button-position select saves immediately (same pattern as the storage mode)
+    alignSel.addEventListener("change", async () => {
+      const okNow = await saveNow(undefined, undefined, undefined, alignSel.value);
+      if (okNow) showToast(s.saved);
+    });
+    modeRadios().forEach((radio) =>
+      radio.addEventListener("change", async () => {
+        const okNow = await saveNow(undefined, undefined, radio.value);
+        if (okNow) showToast(s.modeSaved);
+      })
+    );
+
+    clearBtn.addEventListener("click", async () => {
+      if (!window.confirm(s.clearConfirm)) return;
+      editor.value = "";
+      okLabelInput.value = "";
+      paintCount();
+      await saveNow("", "");
+    });
+
+    refetchNotice().then(() => {
+      if (fsNoticeCache) {
+        editor.value = fsNoticeCache.notice;
+        okLabelInput.value = fsNoticeCache.okLabel || "";
+        alignSel.value = fsNoticeCache.btnAlign || "left";
+        const mode = fsNoticeCache.messageStoreMode || "memory";
+        modeRadios().forEach((r) => { r.checked = r.value === mode; });
+        paintCount();
+      }
+    });
+  }
+
+  // ---------- /admin page: a card next to the app's own notice card ----------
+  let adminCard = null;
+  function removeAdminCard() {
+    if (adminCard) { adminCard.remove(); adminCard = null; }
+  }
+  function ensureAdminCard() {
+    if (!loggedIn || !me || !me.isAdmin || !fsSupported) { removeAdminCard(); return; }
+    if (!/\/admin\b/.test(location.pathname)) { removeAdminCard(); return; }
+    const noticeTextarea = document.getElementById("notice-body");
+    if (!noticeTextarea) return; // admin page not rendered (yet)
+    if (adminCard && document.contains(adminCard)) return;
+    const s = S();
+    const noticeCol = noticeTextarea.closest('[class*="col-"]') || noticeTextarea.closest(".card")?.parentElement;
+    if (!noticeCol || !noticeCol.parentElement) return;
+    const col = document.createElement("div");
+    col.className = noticeCol.className.replace(/mb-\d+/, "mb-3"); // same grid column as the notice card
+    col.innerHTML = `
+      <div class="card bca-fsadmincard">
+        <div class="card-body">
+          <h5 class="card-title"><span class="bca-fsbadge"></span> <span class="bca-fscardtitle"></span></h5>
+          <div class="bca-fscardmount"></div>
+        </div>
+      </div>`;
+    col.querySelector(".bca-fsbadge").textContent = s.cardBadge;
+    col.querySelector(".bca-fscardtitle").textContent = s.editorTitle;
+    makeEditor(col.querySelector(".bca-fscardmount"));
+    noticeCol.parentElement.insertBefore(col, noticeCol.nextSibling); // right beside the notice card
+    adminCard = col;
+  }
+
+  // ---------- chat scroll guard ----------
+  // The bundled app does `scroller.scrollTop = scroller.scrollHeight` on every
+  // new message, which yanks a reader from mid-history. We remember whether
+  // the user was at the bottom: if yes, keep following the tail (new messages
+  // slide in and we stay pinned to the newest); if not, undo the yank by
+  // restoring the reader's position.
+  const scrollerState = new WeakMap(); // el -> { sticky, savedTop, hooked, observer }
+
+  function findChatScroller() {
+    const node = document.querySelector('div[id^="message-"]');
+    let el = node?.parentElement;
+    while (el && el !== document.body) {
+      const cs = getComputedStyle(el);
+      if (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight + 50) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  function hookScroller(sc) {
+    let st = scrollerState.get(sc);
+    if (!st) {
+      st = { sticky: false, savedTop: null, hooked: false, observer: null };
+      scrollerState.set(sc, st);
+    }
+    if (!st.hooked) {
+      st.hooked = true;
+      sc.addEventListener("scroll", () => {
+        const atBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 80;
+        if (atBottom) {
+          st.sticky = true;
+        } else {
+          st.sticky = false;
+          st.savedTop = sc.scrollTop;
+        }
+      }, { passive: true });
+      st.observer = new MutationObserver((muts) => {
+        // only react when actual message nodes were added/removed
+        let relevant = false;
+        for (const m of muts) {
+          for (const n of m.addedNodes) {
+            if (n.nodeType === 1 && (n.matches?.('div[id^="message-"]') || n.querySelector?.('div[id^="message-"]'))) { relevant = true; break; }
+          }
+          if (relevant) break;
+        }
+        if (!relevant) return;
+        setTimeout(() => {
+          if (st.sticky) {
+            sc.scrollTop = sc.scrollHeight; // keep pinned to the newest message
+          } else if (st.savedTop !== null && Math.abs(sc.scrollTop - st.savedTop) > 4) {
+            sc.scrollTop = st.savedTop; // undo the app's forced jump
+          }
+        }, 30);
+      });
+      st.observer.observe(sc, { childList: true, subtree: true });
+    }
+  }
+
+  function ensureScrollGuard() {
+    const sc = findChatScroller();
+    if (sc) hookScroller(sc);
+  }
+
+  // ---------- session poller (1.2 s — mirrors the main addon) ----------
+  let lastLang = curLang();
+  let lastLoginAt = null;
+  let lastOverlayFetch = 0; // throttle for the overlay-open notice refetch
+  async function evaluate() {
+    try {
+      // session state comes from the shared hub (window.__bcaSession) — no own
+      // /api/users/me call (owner request: এক কল, সবাই শোনে)
+      const sess = window.__bcaSession;
+      const next = sess?.loggedIn ? sess.me : null;
+      if (!next) {
+        if (loggedIn) {
+          loggedIn = false; me = null; fsNoticeCache = null; shownFor = null; lastLoginAt = null;
+          closeOverlay(); removeAdminCard();
+        }
+        return;
+      }
+      loggedIn = true;
+      me = next;
+      // a changed loginAt = a fresh login (also catches in-app logout→login
+      // without a page reload) — refetch and show once per login
+      const loginAt = String(next.loginAt || "");
+      if (loginAt !== lastLoginAt) {
+        lastLoginAt = loginAt;
+        if (fsSupported) await refetchNotice();
+        maybeShow();
+      }
+      // follow the app's light/dark theme for the /admin card + overlay bits
+      document.body.classList.toggle("bca-fs-dark", appIsDark());
+      ensureAdminCard();
+      ensureScrollGuard();
+      // mid-session admin edits: while an overlay is on screen, refetch the
+      // notice every ~5s (lightweight JSON; zero cost when nothing is shown)
+      if (fsSupported && host().querySelector(".bca-fsoverlay")) {
+        if (lastOverlayFetch === 0 || Date.now() - lastOverlayFetch >= 5000) {
+          lastOverlayFetch = Date.now();
+          const had = fsNoticeCache;
+          await refetchNotice();
+          if (fsNoticeCache && fsNoticeCache.updatedAt !== (had && had.updatedAt)) {
+            // always carry the cached okLabel/align — the refetch above just
+            // refreshed them; dropping them reset the custom button text
+            // (owner bug: edited label flipped back to "বুঝেছি")
+            showOverlay(fsNoticeCache.notice, fsNoticeCache.okLabel, fsNoticeCache.btnAlign);
+          }
+        }
+      } else {
+        lastOverlayFetch = 0;
+      }
+      if (curLang() !== lastLang) {
+        lastLang = curLang();
+        const okBtn = host().querySelector(".bca-fsok");
+        if (okBtn) okBtn.textContent = okBtn.dataset.custom || S().ok; // keep the admin's custom label
+        const title = document.querySelector(".bca-fscardtitle");
+        if (title) title.textContent = S().editorTitle;
+        const badge = document.querySelector(".bca-fsbadge");
+        if (badge) badge.textContent = S().cardBadge;
+        // editor-card labels live-update too (align selector options included)
+        const alignLabel = document.querySelector(".bca-fsalignlabel");
+        if (alignLabel) alignLabel.textContent = S().btnAlignLabel;
+        const alignSel = document.querySelector(".bca-fsalign");
+        if (alignSel) {
+          const alignOpts = { left: S().btnAlignLeft, center: S().btnAlignCenter, right: S().btnAlignRight };
+          alignSel.querySelectorAll("option").forEach((o) => { o.textContent = alignOpts[o.value] || o.value; });
+        }
+        const okLabelLabel = document.querySelector(".bca-fsoklabel-label");
+        if (okLabelLabel) okLabelLabel.textContent = S().okLabelLabel;
+      }
+    } catch { /* transient network hiccup */ }
+  }
+
+  // session hub subscriber (owner request): no own poll — ui-fixes.js owns
+  // the single /api/users/me request; we react to state transitions and
+  // keep the 5 s overlay-open refetch for mid-session admin edits.
+  let hubState;
+  setInterval(async () => {
+    const sess = window.__bcaSession;
+    if (!sess) return;
+    await evaluate(); // hub-fed (no HTTP inside) — admin-card/scroll-guard/overlay-refetch
+    if (hubState !== undefined && hubState === sess.loggedIn) return; // no transition
+    hubState = sess.loggedIn;
+    if (sess.loggedIn) {
+      loggedIn = true;
+      me = sess.me;
+      if (fsSupported) await refetchNotice();
+      maybeShow();
+      ensureAdminCard();
+      ensureScrollGuard();
+    } else {
+      if (loggedIn) {
+        loggedIn = false; me = null; fsNoticeCache = null; shownFor = null;
+        closeOverlay(); removeAdminCard();
+      }
+    }
+  }, 1500);
+})();
